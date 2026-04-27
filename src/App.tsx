@@ -24,9 +24,10 @@ import {
 } from 'lucide-react';
 import { AnimatePresence, motion } from 'framer-motion';
 import { format } from 'date-fns';
+import type { Socket } from 'socket.io-client';
 
 import { API_BASE_URL, BACKEND_CONFIGURED } from '@/config';
-import { apiRequest, clearAuthToken, getAuthToken, setAuthToken } from '@/lib/api';
+import { apiRequest, clearAuthToken, getAuthToken, getSocketConnection, setAuthToken } from '@/lib/api';
 import { cn } from '@/utils/cn';
 
 type UserRole = 'founder' | 'resident' | 'curator';
@@ -82,6 +83,15 @@ interface SystemStatus {
   roomCount: number;
 }
 
+interface StreamMessageCreatedEvent {
+  message: Message;
+}
+
+interface StreamMessageDeletedEvent {
+  messageIds: string[];
+  reason: 'manual' | 'pruned';
+}
+
 const ROOM_ICONS: Record<string, ReactNode> = {
   plaza: <Home className="h-4 w-4" />,
   tech: <Zap className="h-4 w-4" />,
@@ -110,6 +120,17 @@ function createNotification(title: string, description: string): NotificationIte
     title,
     description,
   };
+}
+
+function formatMessageTime(timestamp: string) {
+  const normalizedTimestamp = timestamp.includes(' ') && !timestamp.includes('T') ? `${timestamp.replace(' ', 'T')}Z` : timestamp;
+  const parsedDate = new Date(normalizedTimestamp);
+
+  if (Number.isNaN(parsedDate.getTime())) {
+    return '--:--';
+  }
+
+  return format(parsedDate, 'HH:mm');
 }
 
 function UserLimitIndicator({ count }: { count: number }) {
@@ -191,7 +212,7 @@ function MessageCard({
                 <span className="rounded border border-white/10 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wider text-white/40">
                   {ROLE_LABELS[message.author.role]}
                 </span>
-                <span className="text-xs text-white/30">• {format(new Date(message.timestamp), 'HH:mm')}</span>
+                <span className="text-xs text-white/30">• {formatMessageTime(message.timestamp)}</span>
               </div>
               {message.author.status && <p className="mt-1 text-[11px] italic text-white/35">{message.author.status}</p>}
             </div>
@@ -338,14 +359,66 @@ export default function App() {
     }
 
     void loadMessages(activeRoom);
+    const fallbackRefreshInterval = window.setInterval(() => {
+      void loadMessages(activeRoom, false);
+    }, 3000);
+
+    let socket: Socket | null = null;
+
+    const handleMessageCreated = (data: StreamMessageCreatedEvent) => {
+      setMessages((prev) => [data.message, ...prev.filter((item) => item.id !== data.message.id)].slice(0, 10));
+      setChatError('');
+      void loadSystemStatus();
+    };
+
+    const handleMessageDeleted = (data: StreamMessageDeletedEvent) => {
+      setMessages((prev) => prev.filter((message) => !data.messageIds.includes(message.id)));
+      setMessageMenuId((prev) => (prev && data.messageIds.includes(prev) ? null : prev));
+      setChatError('');
+      void loadSystemStatus();
+    };
+
+    const handleSocketError = () => {
+      void loadMessages(activeRoom, false);
+    };
+
+    try {
+      socket = getSocketConnection();
+      socket.emit('room:join', activeRoom);
+      socket.on('message.created', handleMessageCreated);
+      socket.on('message.deleted', handleMessageDeleted);
+      socket.on('connect_error', handleSocketError);
+      socket.on('disconnect', handleSocketError);
+    } catch (error) {
+      setChatError(error instanceof Error ? error.message : 'Не удалось подключить real-time соединение.');
+    }
+
+    return () => {
+      window.clearInterval(fallbackRefreshInterval);
+
+      if (!socket) {
+        return;
+      }
+
+      socket.emit('room:leave', activeRoom);
+      socket.off('message.created', handleMessageCreated);
+      socket.off('message.deleted', handleMessageDeleted);
+      socket.off('connect_error', handleSocketError);
+      socket.off('disconnect', handleSocketError);
+    };
+  }, [activeRoom, profile]);
+
+  useEffect(() => {
+    if (!profile) {
+      return;
+    }
 
     const interval = window.setInterval(() => {
-      void loadMessages(activeRoom, false);
       void loadSystemStatus();
     }, 5000);
 
     return () => window.clearInterval(interval);
-  }, [activeRoom, profile]);
+  }, [profile]);
 
   async function bootstrap() {
     const token = getAuthToken();
@@ -457,7 +530,7 @@ export default function App() {
     setChatError('');
 
     try {
-      const response = await apiRequest<{ message: Message }>('/api/messages', {
+      await apiRequest<{ message: Message }>('/api/messages', {
         method: 'POST',
         body: JSON.stringify({
           roomId: activeRoom,
@@ -466,7 +539,6 @@ export default function App() {
         }),
       });
 
-      setMessages((prev) => [response.message, ...prev.filter((item) => item.id !== response.message.id)]);
       setNotifications((prev) => [
         createNotification('Сообщение отправлено', `Твое сообщение появилось в комнате «${activeRoomData?.name ?? activeRoom}».`),
         ...prev,

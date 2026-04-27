@@ -8,6 +8,17 @@ import systemRoutes from './routes/system.js';
 export function createApp() {
   const app = express();
 
+  app.locals.realtime = {
+    broadcast(roomId, event, payload) {
+      const io = app.locals.io;
+      if (!io) {
+        return;
+      }
+
+      io.to(`room:${roomId}`).emit(event, payload);
+    },
+  };
+
   app.use(express.json({ limit: '1mb' }));
 
   app.use('/api/auth', authRoutes);
